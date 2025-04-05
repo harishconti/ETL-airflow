@@ -1,0 +1,2 @@
+pyspark==3.4.1  # Or a version compatible with your chosen Spark base image
+requests==2.31.0 # Or latest
