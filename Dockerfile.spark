@@ -1,0 +1,21 @@
+# Use an official PySpark image (choose a version)
+FROM apache/spark-py:v3.4.1 
+# Or another relevant version
+
+# Set working directory
+WORKDIR /opt/spark/work-dir
+
+# Copy requirements file
+COPY requirements.spark.txt .
+
+# Install Python dependencies
+# Make sure pip is available and up-to-date
+RUN python -m ensurepip --upgrade && \
+    pip install --no-cache-dir -r requirements.spark.txt
+
+# Copy the Spark script into the container
+COPY spark_scripts/etl_job.py .
+
+# Optional: Set entrypoint if you want it to run the script directly,
+# but usually Airflow will specify the command.
+# ENTRYPOINT ["python", "etl_job.py"]

@@ -1,0 +1,125 @@
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.1} # Use a specific Airflow version
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor # Or LocalExecutor for simplicity initially
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow # Needed for Celery
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/1 # Needed for Celery
+    # Add FTP credentials for Airflow DAG to potentially pass to Spark job if needed
+    FTP_HOST: ${FTP_HOST}
+    FTP_USER: ${FTP_USER}
+    FTP_PASS: ${FTP_PASS}
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-0}" # Use IDs from .env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    # Mount data directory to be accessible by Spark job triggered via DockerOperator
+    - ./data:/opt/spark/work-dir/data:ro # Read-only access to input data
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    container_name: postgres_airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432" # Expose if you need external access, otherwise remove
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - airflow_pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:latest
+    container_name: redis_airflow
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379" # Expose if needed
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080" # Access Airflow UI here
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Use CeleryExecutor for parallel task execution (more production-like)
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow_worker
+    command: celery worker
+    # Mount docker socket if using DockerOperator to launch siblings containers
+    volumes:
+       - ./airflow/dags:/opt/airflow/dags
+       - ./airflow/logs:/opt/airflow/logs
+       - ./airflow/plugins:/opt/airflow/plugins
+       - ./data:/opt/spark/work-dir/data:ro
+       - /var/run/docker.sock:/var/run/docker.sock # !! Allows Airflow worker to control Docker !!
+       # Mount spark_scripts if needed by DockerOperator command (depends on how it's used)
+       - ./spark_scripts:/opt/spark/work-dir/spark_scripts
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command: -c 'airflow db init && airflow users create --username admin --password admin --firstname Anonymous --lastname User --role Admin --email admin@example.org'
+    # No depends_on needed as it's a one-off init task
+
+  # --- Spark Image Build ---
+  spark-base: # Service just for building the image
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: pyspark-etl-app:latest # Tag the image
+
+  # --- FTP Server ---
+  ftp-server:
+    image: stilliard/pure-ftpd:latest
+    container_name: ftp_server_local
+    environment:
+      PUBLICHOST: "localhost"
+      FTP_USER_NAME: ${FTP_USER:-user}
+      FTP_USER_PASS: ${FTP_PASS:-password}
+      FTP_USER_HOME: /home/${FTP_USER:-user}
+    ports:
+      - "21:21"       # FTP command port
+      - "30000-30009:30000-30009" # Passive mode ports
+    volumes:
+      - ./ftp_data:/home/${FTP_USER:-user}/ # Mount local dir to FTP user's home
+    restart: unless-stopped
+
+volumes:
+  airflow_pg_data:
